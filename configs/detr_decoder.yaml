@@ -1,0 +1,57 @@
+# DETR Decoder Training Configuration
+# VGGT-based player localization
+
+# ============ Model ============
+model:
+  dim_in: 2048              # VGGT encoder output dimension (frame + global concat)
+  hidden_dim: 256           # Decoder hidden dimension
+  num_queries: 30           # Number of object queries (max players per image)
+  num_decoder_layers: 6     # Transformer decoder layers
+  num_heads: 8              # Attention heads
+  ffn_dim: 2048             # FFN hidden dimension
+  dropout: 0.1              # Dropout rate
+  use_multi_scale: false    # Whether to use multi-scale feature fusion
+  intermediate_layer_idx: [23]  # Which VGGT layers to use
+
+# ============ Data ============
+data:
+  root: "data"
+  train_json: "data/annotations/train.json"
+  val_json: "data/annotations/val.json"
+  test_json: "data/annotations/test.json"
+  target_size: [1078, 1918]  # (H, W) divisible by patch_size=14
+  patch_size: 14
+  max_players: 30
+
+# ============ Training ============
+training:
+  epochs: 100
+  batch_size: 4
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_epochs: 5
+  grad_clip: 0.1
+  num_workers: 4
+
+# ============ Loss ============
+loss:
+  weight_position: 5.0      # L1 position loss weight
+  weight_confidence: 1.0    # BCE confidence loss weight
+  weight_no_object: 0.1     # Weight for no-object class in BCE
+  aux_loss_weight: 0.5      # Weight for auxiliary losses
+
+# ============ Evaluation ============
+eval:
+  conf_threshold: 0.5       # Confidence threshold for predictions
+  match_threshold: 0.25     # Distance threshold for Hungarian matching (meters)
+
+# ============ VGGT ============
+vggt:
+  model: "facebook/VGGT-1B"
+  # Can also use local path: "/path/to/vggt/weights"
+
+# ============ Checkpoints ============
+checkpoint:
+  save_dir: "checkpoints"
+  save_freq: 10             # Save every N epochs
+  log_freq: 100             # Log every N iterations
