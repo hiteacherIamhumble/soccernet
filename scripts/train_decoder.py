@@ -43,6 +43,8 @@ def parse_args():
                         help='Root data directory')
     parser.add_argument('--target_size', type=int, nargs=2, default=[1078, 1918],
                         help='Target image size (H W), divisible by 14')
+    parser.add_argument('--subset_ratio', type=float, default=1.0,
+                        help='Fraction of training data to use (e.g., 0.005 for 1/200)')
 
     # Model
     parser.add_argument('--hidden_dim', type=int, default=128,
@@ -85,6 +87,11 @@ def parse_args():
                         help='DataLoader workers')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device (cuda or cpu)')
+    parser.add_argument('--amp', action='store_true',
+                        help='Use automatic mixed precision (bf16)')
+    parser.add_argument('--amp_dtype', type=str, default='bfloat16',
+                        choices=['bfloat16', 'float16'],
+                        help='AMP dtype (bfloat16 recommended for A100/H100)')
     parser.add_argument('--save_dir', type=str, default='checkpoints',
                         help='Directory to save checkpoints')
     parser.add_argument('--save_freq', type=int, default=10,
@@ -131,12 +138,14 @@ def create_dataloaders(args):
         root_dir=str(data_root / 'train'),
         coco_json=str(data_root / 'annotations' / 'train.json'),
         target_size=tuple(args.target_size) if args.target_size else None,
+        subset_ratio=args.subset_ratio,
     )
 
     val_dataset = SynLocDataset(
         root_dir=str(data_root / 'val'),
         coco_json=str(data_root / 'annotations' / 'val.json'),
         target_size=tuple(args.target_size) if args.target_size else None,
+        subset_ratio=args.subset_ratio,  # Also subsample val for faster evaluation
     )
 
     train_loader = torch.utils.data.DataLoader(
@@ -173,6 +182,7 @@ def train_one_epoch(
     device,
     epoch,
     args,
+    scaler=None,
 ):
     """Train for one epoch."""
     decoder.train()
@@ -182,6 +192,10 @@ def train_one_epoch(
     total_loss_conf = 0.0
     num_batches = 0
 
+    # AMP setup
+    amp_dtype = torch.bfloat16 if args.amp_dtype == 'bfloat16' else torch.float16
+    use_amp = args.amp and device.type == 'cuda'
+
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     for i, (images, targets) in enumerate(pbar):
         # Move to device
@@ -189,26 +203,31 @@ def train_one_epoch(
         targets = [{k: v.to(device) if torch.is_tensor(v) else v for k, v in t.items()}
                    for t in targets]
 
-        # Forward through frozen encoder
+        # Forward through frozen encoder (with AMP)
         with torch.no_grad():
-            aggregated_tokens_list, patch_start_idx = encoder.aggregator(images)
+            with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                aggregated_tokens_list, patch_start_idx = encoder.aggregator(images)
 
-        # Forward through decoder
-        outputs = decoder(aggregated_tokens_list, patch_start_idx)
+        # Forward through decoder (with AMP)
+        with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            outputs = decoder(aggregated_tokens_list, patch_start_idx)
+            loss_dict = criterion(outputs, targets)
+            loss = loss_dict['loss']
 
-        # Compute loss
-        loss_dict = criterion(outputs, targets)
-        loss = loss_dict['loss']
-
-        # Backward
+        # Backward with scaler for fp16, or direct for bf16
         optimizer.zero_grad()
-        loss.backward()
-
-        # Gradient clipping
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(decoder.parameters(), args.grad_clip)
-
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(decoder.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(decoder.parameters(), args.grad_clip)
+            optimizer.step()
 
         # Logging
         total_loss += loss.item()
@@ -231,7 +250,7 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def validate(encoder, decoder, criterion, dataloader, device):
+def validate(encoder, decoder, criterion, dataloader, device, args):
     """Validate the model."""
     decoder.eval()
 
@@ -240,17 +259,20 @@ def validate(encoder, decoder, criterion, dataloader, device):
     total_loss_conf = 0.0
     num_batches = 0
 
+    # AMP setup
+    amp_dtype = torch.bfloat16 if args.amp_dtype == 'bfloat16' else torch.float16
+    use_amp = args.amp and device.type == 'cuda'
+
     for images, targets in tqdm(dataloader, desc='Validation'):
         images = images.to(device)
         targets = [{k: v.to(device) if torch.is_tensor(v) else v for k, v in t.items()}
                    for t in targets]
 
-        # Forward
-        aggregated_tokens_list, patch_start_idx = encoder.aggregator(images)
-        outputs = decoder(aggregated_tokens_list, patch_start_idx)
-
-        # Compute loss
-        loss_dict = criterion(outputs, targets)
+        # Forward with AMP
+        with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            aggregated_tokens_list, patch_start_idx = encoder.aggregator(images)
+            outputs = decoder(aggregated_tokens_list, patch_start_idx)
+            loss_dict = criterion(outputs, targets)
 
         total_loss += loss_dict['loss'].item()
         total_loss_pos += loss_dict['loss_position'].item()
@@ -343,6 +365,14 @@ def main():
         weight_decay=args.weight_decay,
     )
 
+    # Create GradScaler for fp16 (not needed for bf16)
+    scaler = None
+    if args.amp and args.amp_dtype == 'float16':
+        scaler = torch.cuda.amp.GradScaler()
+        logger.info('Using AMP with float16 and GradScaler')
+    elif args.amp:
+        logger.info(f'Using AMP with {args.amp_dtype} (no GradScaler needed)')
+
     # Create scheduler
     warmup_scheduler = LinearLR(
         optimizer,
@@ -383,11 +413,11 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         # Train
         train_metrics = train_one_epoch(
-            encoder, decoder, criterion, train_loader, optimizer, device, epoch, args
+            encoder, decoder, criterion, train_loader, optimizer, device, epoch, args, scaler
         )
 
         # Validate
-        val_metrics = validate(encoder, decoder, criterion, val_loader, device)
+        val_metrics = validate(encoder, decoder, criterion, val_loader, device, args)
 
         # Update scheduler
         scheduler.step()

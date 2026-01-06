@@ -40,6 +40,7 @@ class SynLocDataset(Dataset):
         patch_size: int = 14,
         transform: Optional[Callable] = None,
         max_players: int = 30,
+        subset_ratio: float = 1.0,  # Use only a fraction of data (e.g., 0.005 for 1/200)
     ):
         self.root_dir = Path(root_dir)
         self.patch_size = patch_size
@@ -64,8 +65,13 @@ class SynLocDataset(Dataset):
         for ann in self.coco['annotations']:
             self.img_to_anns[ann['image_id']].append(ann)
 
-        # Store image info
-        self.images = self.coco['images']
+        # Store image info - uniformly sample if subset_ratio < 1
+        all_images = self.coco['images']
+        if subset_ratio < 1.0:
+            step = int(1.0 / subset_ratio)
+            self.images = all_images[::step]
+        else:
+            self.images = all_images
         self.img_id_to_info = {img['id']: img for img in self.images}
 
     def __len__(self) -> int:
