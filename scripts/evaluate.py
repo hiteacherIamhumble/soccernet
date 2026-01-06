@@ -64,6 +64,8 @@ def parse_args():
                         help='Visualize predictions')
     parser.add_argument('--vis_dir', type=str, default='visualizations',
                         help='Directory to save visualizations')
+    parser.add_argument('--amp', action='store_true',
+                        help='Use automatic mixed precision (bf16)')
 
     return parser.parse_args()
 
@@ -92,10 +94,11 @@ def load_models(args, device):
 
     decoder = DETRPlayerDecoder(
         dim_in=2048,
-        hidden_dim=ckpt_args.get('hidden_dim', 256),
+        hidden_dim=ckpt_args.get('hidden_dim', 128),
         num_queries=ckpt_args.get('num_queries', 30),
-        num_decoder_layers=ckpt_args.get('num_decoder_layers', 6),
-        num_heads=ckpt_args.get('num_heads', 8),
+        num_decoder_layers=ckpt_args.get('num_decoder_layers', 3),
+        num_heads=ckpt_args.get('num_heads', 4),
+        ffn_dim=ckpt_args.get('ffn_dim', 512),
         dropout=0.0,  # No dropout during evaluation
     ).to(device)
 
@@ -126,10 +129,13 @@ def postprocess_predictions(
     results = []
 
     for b in range(B):
+        # Apply sigmoid to logits to get probabilities
+        confidences = torch.sigmoid(outputs['confidences'][b])
+
         # Get predictions above threshold
-        mask = outputs['confidences'][b] > conf_threshold
+        mask = confidences > conf_threshold
         pos_norm = outputs['positions'][b][mask]  # [N_det, 2]
-        scores = outputs['confidences'][b][mask]  # [N_det]
+        scores = confidences[mask]  # [N_det]
 
         # Denormalize to pixel coordinates
         H, W = targets[b]['image_size']
@@ -359,6 +365,11 @@ def main():
 
     logger.info(f'Evaluating on {args.split} split ({len(dataset)} images)...')
 
+    # AMP setup
+    use_amp = args.amp and device.type == 'cuda'
+    if use_amp:
+        logger.info('Using AMP (bfloat16) for inference')
+
     # Run inference
     all_predictions = []
     all_targets = []
@@ -368,9 +379,10 @@ def main():
         targets = [{k: v.to(device) if torch.is_tensor(v) else v for k, v in t.items()}
                    for t in targets]
 
-        # Forward
-        aggregated_tokens_list, patch_start_idx = encoder.aggregator(images)
-        outputs = decoder(aggregated_tokens_list, patch_start_idx)
+        # Forward with optional AMP
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+            aggregated_tokens_list, patch_start_idx = encoder.aggregator(images)
+            outputs = decoder(aggregated_tokens_list, patch_start_idx)
 
         # Postprocess
         predictions = postprocess_predictions(outputs, targets, args.conf_threshold)
