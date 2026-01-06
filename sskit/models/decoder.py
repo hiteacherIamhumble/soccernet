@@ -107,11 +107,11 @@ class DETRPlayerDecoder(nn.Module):
     def __init__(
         self,
         dim_in: int = 2048,
-        hidden_dim: int = 256,
+        hidden_dim: int = 128,
         num_queries: int = 30,
-        num_decoder_layers: int = 6,
-        num_heads: int = 8,
-        ffn_dim: int = 2048,
+        num_decoder_layers: int = 3,
+        num_heads: int = 4,
+        ffn_dim: int = 512,
         dropout: float = 0.1,
         intermediate_layer_idx: Optional[List[int]] = None,
         use_multi_scale: bool = False,
@@ -165,9 +165,9 @@ class DETRPlayerDecoder(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
 
-        # Prediction heads
-        self.position_head = MLP(hidden_dim, hidden_dim, 2, num_layers=3)
-        self.confidence_head = MLP(hidden_dim, hidden_dim, 1, num_layers=3)
+        # Prediction heads (simple 2-layer MLPs)
+        self.position_head = MLP(hidden_dim, hidden_dim, 2, num_layers=2)
+        self.confidence_head = MLP(hidden_dim, hidden_dim, 1, num_layers=2)
 
         # Initialize
         self._reset_parameters()

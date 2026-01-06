@@ -45,14 +45,16 @@ def parse_args():
                         help='Target image size (H W), divisible by 14')
 
     # Model
-    parser.add_argument('--hidden_dim', type=int, default=256,
+    parser.add_argument('--hidden_dim', type=int, default=128,
                         help='Decoder hidden dimension')
     parser.add_argument('--num_queries', type=int, default=30,
                         help='Number of object queries')
-    parser.add_argument('--num_decoder_layers', type=int, default=6,
+    parser.add_argument('--num_decoder_layers', type=int, default=3,
                         help='Number of transformer decoder layers')
-    parser.add_argument('--num_heads', type=int, default=8,
+    parser.add_argument('--num_heads', type=int, default=4,
                         help='Number of attention heads')
+    parser.add_argument('--ffn_dim', type=int, default=512,
+                        help='FFN hidden dimension')
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout rate')
 
@@ -316,6 +318,7 @@ def main():
         num_queries=args.num_queries,
         num_decoder_layers=args.num_decoder_layers,
         num_heads=args.num_heads,
+        ffn_dim=args.ffn_dim,
         dropout=args.dropout,
     ).to(device)
 
