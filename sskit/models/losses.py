@@ -79,7 +79,9 @@ class HungarianMatcher(nn.Module):
             # Classification cost: -log(confidence) for positive matches
             # We want high confidence for matched predictions
             # Cost = -log(p) = log(1/p), lower confidence = higher cost
-            cost_conf = -torch.log(pred_conf.unsqueeze(1).expand(-1, N_gt) + 1e-8)
+            # Note: pred_conf are logits, apply sigmoid to get probabilities
+            pred_prob = torch.sigmoid(pred_conf)
+            cost_conf = -torch.log(pred_prob.unsqueeze(1).expand(-1, N_gt) + 1e-8)
 
             # Total cost matrix
             C = self.cost_position * cost_pos + self.cost_confidence * cost_conf
@@ -206,7 +208,7 @@ class SetCriterion(nn.Module):
         targets: List[Dict[str, torch.Tensor]],
         indices: List[Tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
-        """Compute BCE confidence loss."""
+        """Compute BCE confidence loss using logits (AMP-safe)."""
         B, num_queries = pred_confidences.shape
         device = pred_confidences.device
 
@@ -216,11 +218,14 @@ class SetCriterion(nn.Module):
             if len(pred_idx) > 0:
                 target_conf[b, pred_idx] = 1.0
 
-        # Weighted BCE (lower weight for no-object to handle class imbalance)
-        weight = torch.ones_like(target_conf)
-        weight[target_conf == 0] = self.weight_no_object
-
-        loss = F.binary_cross_entropy(pred_confidences, target_conf, weight=weight)
+        # Weighted BCE with logits (AMP-safe)
+        # Note: pred_confidences are logits, not probabilities
+        pos_weight = torch.tensor([1.0 / self.weight_no_object], device=device)
+        loss = F.binary_cross_entropy_with_logits(
+            pred_confidences, target_conf,
+            pos_weight=pos_weight.expand_as(pred_confidences),
+            reduction='mean'
+        )
 
         return loss
 

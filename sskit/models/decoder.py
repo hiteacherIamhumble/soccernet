@@ -263,12 +263,14 @@ class DETRPlayerDecoder(nn.Module):
         positions = self.position_head(decoder_output)  # [B, num_queries, 2]
         positions = positions.sigmoid()  # Normalize to [0, 1]
 
-        confidences = self.confidence_head(decoder_output)  # [B, num_queries, 1]
-        confidences = confidences.squeeze(-1).sigmoid()  # [B, num_queries]
+        # Output logits for confidences (apply sigmoid during inference, not here)
+        # This is required for AMP compatibility with BCE loss
+        confidence_logits = self.confidence_head(decoder_output)  # [B, num_queries, 1]
+        confidence_logits = confidence_logits.squeeze(-1)  # [B, num_queries]
 
         return {
             'positions': positions,
-            'confidences': confidences,
+            'confidences': confidence_logits,  # Logits, apply sigmoid for probabilities
             'decoder_output': decoder_output,  # For auxiliary losses if needed
         }
 
