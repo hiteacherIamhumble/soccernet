@@ -218,14 +218,22 @@ class SetCriterion(nn.Module):
             if len(pred_idx) > 0:
                 target_conf[b, pred_idx] = 1.0
 
-        # Weighted BCE with logits (AMP-safe)
-        # Note: pred_confidences are logits, not probabilities
-        pos_weight = torch.tensor([1.0 / self.weight_no_object], device=device)
+        # Count positives and negatives for proper weighting
+        num_pos = target_conf.sum()
+        num_neg = target_conf.numel() - num_pos
+
+        # Compute BCE with logits
         loss = F.binary_cross_entropy_with_logits(
             pred_confidences, target_conf,
-            pos_weight=pos_weight.expand_as(pred_confidences),
-            reduction='mean'
+            reduction='none'
         )
+
+        # Apply class weighting: weight negatives by weight_no_object
+        # This encourages the model to output low confidence for unmatched queries
+        weight = torch.ones_like(target_conf)
+        weight[target_conf == 0] = self.weight_no_object  # Down-weight negatives
+
+        loss = (loss * weight).sum() / (weight.sum() + 1e-8)
 
         return loss
 
