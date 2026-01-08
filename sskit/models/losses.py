@@ -74,19 +74,29 @@ class HungarianMatcher(nn.Module):
                 ))
                 continue
 
+            # Convert to float32 for numerical stability (AMP can cause issues)
+            pred_pos_f32 = pred_pos.float()
+            gt_pos_f32 = gt_pos.float()
+            pred_conf_f32 = pred_conf.float()
+
             # Compute L1 distance cost matrix
             # [num_queries, N_gt]
-            cost_pos = torch.cdist(pred_pos, gt_pos, p=1)
+            cost_pos = torch.cdist(pred_pos_f32, gt_pos_f32, p=1)
 
             # Classification cost: -log(confidence) for positive matches
             # We want high confidence for matched predictions
             # Cost = -log(p) = log(1/p), lower confidence = higher cost
             # Note: pred_conf are logits, apply sigmoid to get probabilities
-            pred_prob = torch.sigmoid(pred_conf)
-            cost_conf = -torch.log(pred_prob.unsqueeze(1).expand(-1, N_gt) + 1e-8)
+            pred_prob = torch.sigmoid(pred_conf_f32)
+            # Clamp probability to avoid log(0) and extreme costs
+            pred_prob = pred_prob.clamp(min=1e-6, max=1.0 - 1e-6)
+            cost_conf = -torch.log(pred_prob.unsqueeze(1).expand(-1, N_gt))
 
             # Total cost matrix
             C = self.cost_position * cost_pos + self.cost_confidence * cost_conf
+
+            # Handle NaN/inf values that may arise from numerical issues
+            C = torch.nan_to_num(C, nan=1e6, posinf=1e6, neginf=-1e6)
             C = C.cpu().numpy()
 
             # Hungarian algorithm (minimize total cost)

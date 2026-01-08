@@ -271,6 +271,9 @@ class DETRPlayerDecoder(nn.Module):
         confidence_logits = self.confidence_head(decoder_output)  # [B, num_queries, 1]
         confidence_logits = confidence_logits.squeeze(-1)  # [B, num_queries]
 
+        # Clamp confidence logits to prevent extreme values that cause NaN in loss
+        confidence_logits = confidence_logits.clamp(min=-50, max=50)
+
         return {
             'positions': positions,
             'confidences': confidence_logits,  # Logits, apply sigmoid for probabilities
@@ -362,12 +365,14 @@ class DETRPlayerDecoderWithAux(DETRPlayerDecoder):
                 # Auxiliary predictions (positions use sigmoid for [0,1], confidences output logits)
                 aux_pos = self.aux_position_heads[i](output).sigmoid()
                 aux_conf = self.aux_confidence_heads[i](output).squeeze(-1)  # Output logits, not probabilities
+                aux_conf = aux_conf.clamp(min=-50, max=50)  # Prevent extreme values
                 aux_positions.append(aux_pos)
                 aux_confidences.append(aux_conf)
 
         # Final predictions (positions use sigmoid for [0,1], confidences output logits)
         positions = self.position_head(output).sigmoid()
         confidences = self.confidence_head(output).squeeze(-1)  # Output logits, not probabilities
+        confidences = confidences.clamp(min=-50, max=50)  # Prevent extreme values
 
         return {
             'positions': positions,
