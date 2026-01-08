@@ -133,3 +133,6 @@ temp/
 
 # Wandb
 wandb/
+
+# Data files
+data/
