@@ -29,7 +29,10 @@ def distort(poly, pkt):
     poly = torch.as_tensor(poly)
     rr = (pkt ** 2).sum(-1, keepdim=True).sqrt()
     rr2 = polyval(poly, torch.arctan(rr))
-    scale = rr2 / rr
+    # Avoid division by zero at origin
+    scale = rr2 / (rr + 1e-8)
+    # For points at origin, scale should be 1 (no distortion)
+    scale = torch.where(rr < 1e-8, torch.ones_like(scale), scale)
     return scale * pkt
 
 def undistort(poly, pkt):
@@ -37,7 +40,10 @@ def undistort(poly, pkt):
     poly = torch.as_tensor(poly)
     rr2 = (pkt ** 2).sum(-1, keepdim=True).sqrt()
     rr = torch.tan(polyval(poly, rr2))
-    scale = rr / rr2
+    # Avoid division by zero at origin
+    scale = rr / (rr2 + 1e-8)
+    # For points at origin, scale should be 1 (no distortion)
+    scale = torch.where(rr2 < 1e-8, torch.ones_like(scale), scale)
     return scale * pkt
 
 

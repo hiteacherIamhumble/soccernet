@@ -420,7 +420,7 @@ class WorldCoordinateLoss(nn.Module):
                 continue
 
             # Get matched predictions in [0,1] normalized coords
-            pred_norm = pred_positions[b][pred_idx]  # [N, 2]
+            pred_norm = pred_positions[b][pred_idx].float()  # Convert to float32
 
             # Convert to pixel coords
             H, W = targets[b]['image_size']
@@ -433,22 +433,39 @@ class WorldCoordinateLoss(nn.Module):
             pred_cam = (pred_px - center) / W
 
             # Project to world coordinates using camera parameters
-            camera_matrix = targets[b]['camera_matrix'].to(pred_px.device)
-            undist_poly = targets[b]['undist_poly'].to(pred_px.device)
+            camera_matrix = targets[b]['camera_matrix'].to(device=pred_px.device, dtype=pred_px.dtype)
+            undist_poly = targets[b]['undist_poly'].to(device=pred_px.device, dtype=pred_px.dtype)
 
             # Handle case where undist_poly might be empty
             if undist_poly.numel() == 0:
                 continue
 
-            pred_world = image_to_ground(camera_matrix, undist_poly, pred_cam)  # [N, 3]
-            pred_world_2d = pred_world[:, :2]  # [N, 2] - x, y on pitch
+            # Skip if ground truth world positions are missing or empty
+            gt_world_raw = targets[b]['positions_world']
+            if gt_world_raw.numel() == 0 or len(gt_idx) == 0:
+                continue
 
-            # Ground truth world positions
-            gt_world = targets[b]['positions_world'][gt_idx].to(pred_px.device)
+            try:
+                pred_world = image_to_ground(camera_matrix, undist_poly, pred_cam)  # [N, 3]
+                pred_world_2d = pred_world[:, :2]  # [N, 2] - x, y on pitch
 
-            # L1 loss in meters
-            loss = loss + F.l1_loss(pred_world_2d, gt_world, reduction='sum')
-            num_matched += len(pred_idx)
+                # Check for NaN in projection (can happen with extreme camera angles)
+                if torch.isnan(pred_world_2d).any() or torch.isinf(pred_world_2d).any():
+                    continue
+
+                # Ground truth world positions
+                gt_world = gt_world_raw[gt_idx].to(device=pred_px.device, dtype=pred_px.dtype)
+
+                # Check for NaN in ground truth
+                if torch.isnan(gt_world).any():
+                    continue
+
+                # L1 loss in meters
+                loss = loss + F.l1_loss(pred_world_2d, gt_world, reduction='sum')
+                num_matched += len(pred_idx)
+            except Exception:
+                # Skip this batch element if projection fails
+                continue
 
         # Normalize by number of matched coordinates and scale by tau
         if num_matched > 0:

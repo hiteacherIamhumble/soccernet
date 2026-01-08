@@ -206,10 +206,20 @@ def train_one_epoch(
         targets = [{k: v.to(device) if torch.is_tensor(v) else v for k, v in t.items()}
                    for t in targets]
 
+        # Check for NaN in input
+        if torch.isnan(images).any():
+            logger.warning(f'Batch {i}: NaN in input images, skipping')
+            continue
+
         # Forward through frozen encoder (with AMP)
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 aggregated_tokens_list, patch_start_idx = encoder.aggregator(images)
+
+        # Check for NaN in encoder output
+        if any(torch.isnan(t).any() for t in aggregated_tokens_list):
+            logger.warning(f'Batch {i}: NaN in encoder output, skipping')
+            continue
 
         # Get image size from first target for decoder positional encoding
         image_size = targets[0]['image_size']
@@ -217,8 +227,19 @@ def train_one_epoch(
         # Forward through decoder (with AMP)
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
             outputs = decoder(aggregated_tokens_list, patch_start_idx, image_size=image_size)
+
+            # Check for NaN in decoder output
+            if torch.isnan(outputs['positions']).any() or torch.isnan(outputs['confidences']).any():
+                logger.warning(f'Batch {i}: NaN in decoder output, skipping')
+                continue
+
             loss_dict = criterion(outputs, targets)
             loss = loss_dict['loss']
+
+        # Check for NaN loss and skip batch
+        if torch.isnan(loss) or torch.isinf(loss):
+            logger.warning(f'Batch {i}: NaN/Inf loss detected, skipping batch')
+            continue
 
         # Backward with scaler for fp16, or direct for bf16
         optimizer.zero_grad()
