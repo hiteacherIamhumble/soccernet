@@ -81,6 +81,8 @@ def parse_args():
                         help='Confidence loss weight')
     parser.add_argument('--weight_no_object', type=float, default=0.1,
                         help='No-object weight in confidence loss')
+    parser.add_argument('--weight_world', type=float, default=2.0,
+                        help='World coordinate loss weight (0 to disable)')
 
     # Other
     parser.add_argument('--num_workers', type=int, default=4,
@@ -190,6 +192,7 @@ def train_one_epoch(
     total_loss = 0.0
     total_loss_pos = 0.0
     total_loss_conf = 0.0
+    total_loss_world = 0.0
     num_batches = 0
 
     # AMP setup
@@ -208,9 +211,12 @@ def train_one_epoch(
             with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 aggregated_tokens_list, patch_start_idx = encoder.aggregator(images)
 
+        # Get image size from first target for decoder positional encoding
+        image_size = targets[0]['image_size']
+
         # Forward through decoder (with AMP)
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-            outputs = decoder(aggregated_tokens_list, patch_start_idx)
+            outputs = decoder(aggregated_tokens_list, patch_start_idx, image_size=image_size)
             loss_dict = criterion(outputs, targets)
             loss = loss_dict['loss']
 
@@ -233,6 +239,7 @@ def train_one_epoch(
         total_loss += loss.item()
         total_loss_pos += loss_dict['loss_position'].item()
         total_loss_conf += loss_dict['loss_confidence'].item()
+        total_loss_world += loss_dict['loss_world'].item()
         num_batches += 1
 
         if (i + 1) % args.log_freq == 0:
@@ -240,12 +247,14 @@ def train_one_epoch(
                 'loss': f'{total_loss / num_batches:.4f}',
                 'pos': f'{total_loss_pos / num_batches:.4f}',
                 'conf': f'{total_loss_conf / num_batches:.4f}',
+                'world': f'{total_loss_world / num_batches:.4f}',
             })
 
     return {
         'loss': total_loss / num_batches,
         'loss_position': total_loss_pos / num_batches,
         'loss_confidence': total_loss_conf / num_batches,
+        'loss_world': total_loss_world / num_batches,
     }
 
 
@@ -257,6 +266,7 @@ def validate(encoder, decoder, criterion, dataloader, device, args):
     total_loss = 0.0
     total_loss_pos = 0.0
     total_loss_conf = 0.0
+    total_loss_world = 0.0
     num_batches = 0
 
     # AMP setup
@@ -268,21 +278,26 @@ def validate(encoder, decoder, criterion, dataloader, device, args):
         targets = [{k: v.to(device) if torch.is_tensor(v) else v for k, v in t.items()}
                    for t in targets]
 
+        # Get image size from first target
+        image_size = targets[0]['image_size']
+
         # Forward with AMP
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
             aggregated_tokens_list, patch_start_idx = encoder.aggregator(images)
-            outputs = decoder(aggregated_tokens_list, patch_start_idx)
+            outputs = decoder(aggregated_tokens_list, patch_start_idx, image_size=image_size)
             loss_dict = criterion(outputs, targets)
 
         total_loss += loss_dict['loss'].item()
         total_loss_pos += loss_dict['loss_position'].item()
         total_loss_conf += loss_dict['loss_confidence'].item()
+        total_loss_world += loss_dict['loss_world'].item()
         num_batches += 1
 
     return {
         'loss': total_loss / num_batches,
         'loss_position': total_loss_pos / num_batches,
         'loss_confidence': total_loss_conf / num_batches,
+        'loss_world': total_loss_world / num_batches,
     }
 
 
@@ -356,6 +371,7 @@ def main():
         weight_position=args.weight_position,
         weight_confidence=args.weight_confidence,
         weight_no_object=args.weight_no_object,
+        weight_world=args.weight_world,
     )
 
     # Create optimizer
@@ -425,8 +441,10 @@ def main():
         # Log
         logger.info(
             f'Epoch {epoch + 1}/{args.epochs} - '
-            f'Train: loss={train_metrics["loss"]:.4f}, pos={train_metrics["loss_position"]:.4f}, conf={train_metrics["loss_confidence"]:.4f} | '
-            f'Val: loss={val_metrics["loss"]:.4f}, pos={val_metrics["loss_position"]:.4f}, conf={val_metrics["loss_confidence"]:.4f} | '
+            f'Train: loss={train_metrics["loss"]:.4f}, pos={train_metrics["loss_position"]:.4f}, '
+            f'conf={train_metrics["loss_confidence"]:.4f}, world={train_metrics["loss_world"]:.4f} | '
+            f'Val: loss={val_metrics["loss"]:.4f}, pos={val_metrics["loss_position"]:.4f}, '
+            f'conf={val_metrics["loss_confidence"]:.4f}, world={val_metrics["loss_world"]:.4f} | '
             f'LR: {scheduler.get_last_lr()[0]:.6f}'
         )
 

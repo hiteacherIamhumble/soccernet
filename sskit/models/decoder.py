@@ -228,20 +228,23 @@ class DETRPlayerDecoder(nn.Module):
 
         B, P_patches, _ = features.shape
 
-        # Compute patch grid size
-        # For 1080p padded to 1078x1918: H_patch=77, W_patch=137
-        # P_patches = H_patch * W_patch
-        H_patch = int(math.sqrt(P_patches * 1080 / 1920))  # Approximate
-        W_patch = P_patches // H_patch
-        # Adjust if needed
-        while H_patch * W_patch != P_patches:
-            H_patch += 1
+        # Compute patch grid size from image dimensions if available
+        if image_size is not None:
+            H_img, W_img = image_size
+            H_patch = H_img // 14  # patch_size = 14
+            W_patch = W_img // 14
+        else:
+            # Fallback: assume ~16:9 aspect ratio
+            H_patch = int(math.sqrt(P_patches * 9 / 16))
             W_patch = P_patches // H_patch
-            if H_patch > P_patches:
-                # Fallback: assume square-ish
+            # Adjust if needed
+            while H_patch * W_patch != P_patches and H_patch > 0:
+                H_patch -= 1
+                W_patch = P_patches // H_patch
+            if H_patch <= 0 or H_patch * W_patch != P_patches:
+                # Final fallback: assume square-ish
                 H_patch = int(math.sqrt(P_patches))
                 W_patch = P_patches // H_patch
-                break
 
         # Reshape to 2D for positional encoding
         features_2d = features.view(B, H_patch, W_patch, -1).permute(0, 3, 1, 2)  # [B, C, H, W]
@@ -321,16 +324,23 @@ class DETRPlayerDecoderWithAux(DETRPlayerDecoder):
 
         B, P_patches, _ = features.shape
 
-        # Compute patch grid
-        H_patch = int(math.sqrt(P_patches * 1080 / 1920))
-        W_patch = P_patches // H_patch
-        while H_patch * W_patch != P_patches:
-            H_patch += 1
+        # Compute patch grid size from image dimensions if available
+        if image_size is not None:
+            H_img, W_img = image_size
+            H_patch = H_img // 14  # patch_size = 14
+            W_patch = W_img // 14
+        else:
+            # Fallback: assume ~16:9 aspect ratio
+            H_patch = int(math.sqrt(P_patches * 9 / 16))
             W_patch = P_patches // H_patch
-            if H_patch > P_patches:
+            # Adjust if needed
+            while H_patch * W_patch != P_patches and H_patch > 0:
+                H_patch -= 1
+                W_patch = P_patches // H_patch
+            if H_patch <= 0 or H_patch * W_patch != P_patches:
+                # Final fallback: assume square-ish
                 H_patch = int(math.sqrt(P_patches))
                 W_patch = P_patches // H_patch
-                break
 
         # Positional encoding
         features_2d = features.view(B, H_patch, W_patch, -1).permute(0, 3, 1, 2)
@@ -349,20 +359,20 @@ class DETRPlayerDecoderWithAux(DETRPlayerDecoder):
             output = layer(output, features)
 
             if i < self.num_decoder_layers - 1:
-                # Auxiliary predictions
+                # Auxiliary predictions (positions use sigmoid for [0,1], confidences output logits)
                 aux_pos = self.aux_position_heads[i](output).sigmoid()
-                aux_conf = self.aux_confidence_heads[i](output).squeeze(-1).sigmoid()
+                aux_conf = self.aux_confidence_heads[i](output).squeeze(-1)  # Output logits, not probabilities
                 aux_positions.append(aux_pos)
                 aux_confidences.append(aux_conf)
 
-        # Final predictions
+        # Final predictions (positions use sigmoid for [0,1], confidences output logits)
         positions = self.position_head(output).sigmoid()
-        confidences = self.confidence_head(output).squeeze(-1).sigmoid()
+        confidences = self.confidence_head(output).squeeze(-1)  # Output logits, not probabilities
 
         return {
             'positions': positions,
-            'confidences': confidences,
+            'confidences': confidences,  # Logits - apply sigmoid during inference
             'aux_positions': aux_positions,
-            'aux_confidences': aux_confidences,
+            'aux_confidences': aux_confidences,  # Logits
             'decoder_output': output,
         }

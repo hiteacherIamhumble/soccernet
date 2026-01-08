@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
+from sskit.camera import image_to_ground
+
 
 class HungarianMatcher(nn.Module):
     """
@@ -105,6 +107,7 @@ class SetCriterion(nn.Module):
     Computes:
     - L1 loss on matched position predictions
     - BCE loss on confidence predictions (matched = 1, unmatched = 0)
+    - Optional world coordinate loss for better evaluation alignment
     """
 
     def __init__(
@@ -113,6 +116,7 @@ class SetCriterion(nn.Module):
         weight_position: float = 5.0,
         weight_confidence: float = 1.0,
         weight_no_object: float = 0.1,
+        weight_world: float = 0.0,
         aux_loss_weight: float = 0.5,
     ):
         """
@@ -121,6 +125,7 @@ class SetCriterion(nn.Module):
             weight_position: Weight for position loss
             weight_confidence: Weight for confidence loss
             weight_no_object: Weight for no-object class in BCE (handles class imbalance)
+            weight_world: Weight for world coordinate loss (0 to disable)
             aux_loss_weight: Weight for auxiliary losses from intermediate decoder layers
         """
         super().__init__()
@@ -128,7 +133,11 @@ class SetCriterion(nn.Module):
         self.weight_position = weight_position
         self.weight_confidence = weight_confidence
         self.weight_no_object = weight_no_object
+        self.weight_world = weight_world
         self.aux_loss_weight = aux_loss_weight
+
+        # World coordinate loss (optional)
+        self.world_loss = WorldCoordinateLoss(tau=5.0) if weight_world > 0 else None
 
     def forward(
         self,
@@ -146,6 +155,10 @@ class SetCriterion(nn.Module):
                 - 'aux_confidences': optional list of [B, num_queries] from intermediate layers
             targets: list of B dicts with:
                 - 'positions': [N_gt, 2]
+                - 'positions_world': [N_gt, 2] (for world coordinate loss)
+                - 'image_size': (H, W)
+                - 'camera_matrix': [3, 4]
+                - 'undist_poly': distortion polynomial
 
         Returns:
             dict with loss values
@@ -159,13 +172,21 @@ class SetCriterion(nn.Module):
         # Confidence loss (BCE)
         loss_conf = self._compute_confidence_loss(outputs['confidences'], targets, indices)
 
+        # World coordinate loss (optional)
+        loss_world = outputs['positions'].new_zeros(())
+        if self.world_loss is not None:
+            loss_world = self.world_loss(outputs['positions'], targets, indices)
+
         # Total loss
-        loss = self.weight_position * loss_pos + self.weight_confidence * loss_conf
+        loss = (self.weight_position * loss_pos +
+                self.weight_confidence * loss_conf +
+                self.weight_world * loss_world)
 
         losses = {
             'loss': loss,
             'loss_position': loss_pos,
             'loss_confidence': loss_conf,
+            'loss_world': loss_world,
         }
 
         # Auxiliary losses
@@ -183,7 +204,7 @@ class SetCriterion(nn.Module):
         indices: List[Tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
         """Compute L1 position loss on matched pairs."""
-        loss = torch.tensor(0.0, device=pred_positions.device)
+        loss = pred_positions.new_zeros(())  # Maintains gradient graph
         num_matched = 0
 
         for b, (pred_idx, gt_idx) in enumerate(indices):
@@ -196,9 +217,9 @@ class SetCriterion(nn.Module):
             loss = loss + F.l1_loss(pred_pos, gt_pos, reduction='sum')
             num_matched += len(pred_idx)
 
-        # Normalize by number of matched pairs
+        # Normalize by number of matched pairs * 2 (for x and y coordinates)
         if num_matched > 0:
-            loss = loss / num_matched
+            loss = loss / (num_matched * 2)
 
         return loss
 
@@ -246,7 +267,7 @@ class SetCriterion(nn.Module):
         aux_positions = outputs['aux_positions']
         aux_confidences = outputs['aux_confidences']
 
-        total_aux_loss = torch.tensor(0.0, device=outputs['positions'].device)
+        total_aux_loss = outputs['positions'].new_zeros(())  # Maintains gradient graph
         num_aux = len(aux_positions)
 
         for i in range(num_aux):
@@ -273,6 +294,8 @@ class FocalLoss(nn.Module):
     Focal loss for handling class imbalance in confidence prediction.
 
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    This implementation works with logits for numerical stability and AMP compatibility.
     """
 
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
@@ -282,21 +305,24 @@ class FocalLoss(nn.Module):
 
     def forward(
         self,
-        pred: torch.Tensor,
+        pred_logits: torch.Tensor,
         target: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
-            pred: Predicted probabilities [B, N]
+            pred_logits: Predicted logits [B, N] (NOT probabilities)
             target: Binary targets [B, N]
         """
-        p_t = pred * target + (1 - pred) * (1 - target)
+        # Compute BCE with logits (numerically stable)
+        bce_loss = F.binary_cross_entropy_with_logits(pred_logits, target, reduction='none')
+
+        # Compute probabilities for focal weight
+        pred_prob = torch.sigmoid(pred_logits)
+        p_t = pred_prob * target + (1 - pred_prob) * (1 - target)
         alpha_t = self.alpha * target + (1 - self.alpha) * (1 - target)
 
         focal_weight = alpha_t * (1 - p_t) ** self.gamma
-
-        bce = F.binary_cross_entropy(pred, target, reduction='none')
-        loss = focal_weight * bce
+        loss = focal_weight * bce_loss
 
         return loss.mean()
 
@@ -339,3 +365,83 @@ class SetCriterionWithFocal(SetCriterion):
                 target_conf[b, pred_idx] = 1.0
 
         return self.focal_loss(pred_confidences, target_conf)
+
+
+class WorldCoordinateLoss(nn.Module):
+    """
+    Computes L1 loss in world coordinates (meters on pitch).
+
+    Projects predicted image positions to world coordinates using camera parameters,
+    then computes L1 distance to ground truth world positions. This aligns training
+    with the mAP-LocSim evaluation metric which uses world-space distances.
+    """
+
+    def __init__(self, tau: float = 5.0):
+        """
+        Args:
+            tau: Scale factor for loss normalization (matches mAP-LocSim tau=5m scale)
+        """
+        super().__init__()
+        self.tau = tau
+
+    def forward(
+        self,
+        pred_positions: torch.Tensor,
+        targets: List[Dict[str, torch.Tensor]],
+        indices: List[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """
+        Convert predicted image positions to world coords and compute L1 loss.
+
+        Args:
+            pred_positions: [B, num_queries, 2] predicted positions in [0,1]
+            targets: List of B dicts with 'positions_world', 'image_size',
+                     'camera_matrix', 'undist_poly'
+            indices: List of B tuples (pred_idx, gt_idx) from Hungarian matching
+
+        Returns:
+            Scalar L1 loss in world coordinates
+        """
+        loss = pred_positions.new_zeros(())
+        num_matched = 0
+
+        for b, (pred_idx, gt_idx) in enumerate(indices):
+            if len(pred_idx) == 0:
+                continue
+
+            # Get matched predictions in [0,1] normalized coords
+            pred_norm = pred_positions[b][pred_idx]  # [N, 2]
+
+            # Convert to pixel coords
+            H, W = targets[b]['image_size']
+            pred_px = pred_norm.clone()
+            pred_px[:, 0] = pred_px[:, 0] * W
+            pred_px[:, 1] = pred_px[:, 1] * H
+
+            # Convert to camera normalized coords (centered, normalized by width)
+            center = torch.tensor([(W - 1) / 2, (H - 1) / 2], device=pred_px.device, dtype=pred_px.dtype)
+            pred_cam = (pred_px - center) / W
+
+            # Project to world coordinates using camera parameters
+            camera_matrix = targets[b]['camera_matrix'].to(pred_px.device)
+            undist_poly = targets[b]['undist_poly'].to(pred_px.device)
+
+            # Handle case where undist_poly might be empty
+            if undist_poly.numel() == 0:
+                continue
+
+            pred_world = image_to_ground(camera_matrix, undist_poly, pred_cam)  # [N, 3]
+            pred_world_2d = pred_world[:, :2]  # [N, 2] - x, y on pitch
+
+            # Ground truth world positions
+            gt_world = targets[b]['positions_world'][gt_idx].to(pred_px.device)
+
+            # L1 loss in meters
+            loss = loss + F.l1_loss(pred_world_2d, gt_world, reduction='sum')
+            num_matched += len(pred_idx)
+
+        # Normalize by number of matched coordinates and scale by tau
+        if num_matched > 0:
+            loss = loss / (num_matched * 2 * self.tau)
+
+        return loss
